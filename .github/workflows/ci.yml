@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck libxml2-utils
+      - name: shellcheck
+        run: shellcheck -x ct/*.sh install/*.sh tools/airprint-announce tests/*.sh
+      - name: Tests
+        run: bash tests/run-tests.sh

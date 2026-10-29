@@ -1,0 +1,18 @@
+"/tmp/airprint-announce.test":
+    Get-Printer-Attributes:
+        attributes-charset (charset) = utf-8
+        attributes-natural-language (naturalLanguage) = en
+        printer-uri (uri) = ipp://10.0.50.155/ipp/print
+        requested-attributes (1setOf keyword) = printer-make-and-model,printer-uuid,printer-location,document-format-supported,urf-supported,color-supported,sides-supported
+    Get-Printer-Attributes (airprint-announce)                           [PASS]
+        RECEIVED: 1342 bytes in response
+        status-code = successful-ok (successful-ok)
+        attributes-charset (charset) = utf-8
+        attributes-natural-language (naturalLanguage) = en-us
+        printer-make-and-model (textWithoutLanguage) = Kyocera TASKalfa 352ci
+        printer-uuid (uri) = urn:uuid:4509a320-00a0-008f-00b6-002507510eca
+        printer-location (textWithoutLanguage) = Büro & Flur <2. OG> "Süd"
+        document-format-supported (1setOf mimeMediaType) = application/octet-stream,image/jpeg,application/pdf,image/urf,image/pwg-raster,application/vnd.hp-PCL,application/postscript,application/vnd.kyocera-prescribe
+        urf-supported (1setOf keyword) = V1.4,CP1,DM1,FN3-5-11-12-14-20-21-22-23-24-28-31-50-51-52-53,IS1-4-7-20,MT1-2-3-4-5-6-8-9-10-11-12-13-14-15-16-17-18-19,OB10,PQ4-5,RS600,SRGB24,W8
+        color-supported (boolean) = true
+        sides-supported (1setOf keyword) = one-sided,two-sided-long-edge,two-sided-short-edge

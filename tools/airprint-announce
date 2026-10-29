@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Florian Wilde (Florian Wilde IT SysOp)
+# Author: Florian Wilde
+# License: MIT | https://github.com/florianwilde/airprint-announce/raw/main/LICENSE
+# Source: https://github.com/florianwilde/airprint-announce
+#
+# airprint-announce – kündigt Netzwerkdrucker stellvertretend per Bonjour/mDNS
+# (Avahi) als AirPrint-Drucker an. Es läuft kein Druckserver: iPhones/iPads
+# drucken direkt per IPP/IPPS auf den Drucker.
+
+set -euo pipefail
+# Ab Bash 5.2 stünde "&" in ${var//muster/ersatz} sonst für den Treffer.
+shopt -u patsub_replacement 2>/dev/null || true
+
+AVAHI_DIR="${AVAHI_DIR:-/etc/avahi}"
+HOSTS_FILE="${AVAHI_DIR}/hosts"
+SERVICES_DIR="${AVAHI_DIR}/services"
+SERVICE_PREFIX="airprint-announce-"
+MARKER="airprint-announce"
+URF_FALLBACK="V1.4,CP1,W8,SRGB24,RS300,DM1,IS1"
+PDL_CANDIDATES=(application/pdf image/urf image/pwg-raster image/jpeg)
+
+# Ein abweichendes AVAHI_DIR ist der Testmodus: kein root nötig, kein Neustart.
+TEST_MODE=0
+[[ "$AVAHI_DIR" != "/etc/avahi" ]] && TEST_MODE=1
+
+die() {
+  echo "Fehler: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "Warnung: $*" >&2
+}
+
+usage() {
+  cat <<EOF
+Verwendung: ${0##*/} <Befehl> [Argumente]
+
+Befehle:
+  add <IP> ["Name"]   Drucker abfragen und per Bonjour/AirPrint ankündigen
+  remove <IP>         Ankündigung eines Druckers entfernen
+  refresh             Alle angekündigten Drucker neu abfragen
+  list                Angekündigte Drucker anzeigen
+  status              Avahi-Status und sichtbare IPP-Dienste anzeigen
+EOF
+}
+
+require_root() {
+  ((TEST_MODE)) && return 0
+  [[ "$(id -u)" -eq 0 ]] || die "Dieser Befehl muss als root ausgeführt werden."
+}
+
+valid_ip() {
+  local ip="$1" octet
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for octet in "${BASH_REMATCH[@]:1}"; do
+    ((10#$octet <= 255)) || return 1
+  done
+}
+
+ip_slug() {
+  echo "${1//./-}"
+}
+
+host_name_for() {
+  echo "airprint-$(ip_slug "$1").local"
+}
+
+service_file_for() {
+  echo "${SERVICES_DIR}/${SERVICE_PREFIX}$(ip_slug "$1").service"
+}
+
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  s="${s//\"/&quot;}"
+  s="${s//\'/&apos;}"
+  printf '%s' "$s"
+}
+
+xml_unescape() {
+  local s="$1"
+  s="${s//&lt;/<}"
+  s="${s//&gt;/>}"
+  s="${s//&quot;/\"}"
+  s="${s//&apos;/\'}"
+  s="${s//&#45;/-}"
+  s="${s//&amp;/&}"
+  printf '%s' "$s"
+}
+
+# Für XML-Kommentare: zusätzlich "-" maskieren, da "--" dort unzulässig ist.
+comment_escape() {
+  local s
+  s="$(xml_escape "$1")"
+  printf '%s' "${s//-/&#45;}"
+}
+
+restart_avahi() {
+  if ((TEST_MODE)); then
+    echo "Testmodus (AVAHI_DIR=${AVAHI_DIR}): avahi-daemon wird nicht neu gestartet."
+    return 0
+  fi
+  systemctl restart avahi-daemon || die "avahi-daemon konnte nicht neu gestartet werden."
+}
+
+# Gibt den Wert eines Attributs aus der ipptool-Ausgabe zurück.
+# Zeilenformat: "    name (typ) = wert"; bei Mehrfachtreffern zählt der letzte.
+ipp_attr() {
+  local name="$1" output="$2"
+  printf '%s\n' "$output" | sed -n "s/^[[:space:]]*${name} ([^)]*) = //p" | tail -n 1
+}
+
+query_printer() {
+  local ip="$1" testfile output rc=0
+  command -v ipptool >/dev/null 2>&1 || die "ipptool nicht gefunden (Paket cups-ipp-utils installieren)."
+  testfile="$(mktemp --suffix=.test)"
+  cat >"$testfile" <<'EOF'
+{
+  NAME "Get-Printer-Attributes (airprint-announce)"
+  OPERATION Get-Printer-Attributes
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR naturalLanguage attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR keyword requested-attributes printer-make-and-model,printer-uuid,printer-location,document-format-supported,urf-supported,color-supported,sides-supported
+  STATUS successful-ok
+}
+EOF
+  output="$(ipptool -T 15 -tv "ipp://${ip}/ipp/print" "$testfile" 2>&1)" || rc=$?
+  rm -f "$testfile"
+  if ((rc != 0)); then
+    printf '%s\n' "$output" >&2
+    die "Drucker ${ip} antwortet nicht auf IPP (ipp://${ip}/ipp/print)."
+  fi
+  printf '%s\n' "$output"
+}
+
+remove_hosts() {
+  local ip="$1" tmp
+  [[ -f "$HOSTS_FILE" ]] || return 0
+  tmp="$(mktemp)"
+  # An das Zeilenende verankert: der Marker für 10.0.50.15 ist Präfix von 10.0.50.155.
+  grep -v -E "# ${MARKER}:${ip//./\\.}\$" "$HOSTS_FILE" >"$tmp" || true
+  cat "$tmp" >"$HOSTS_FILE"
+  rm -f "$tmp"
+}
+
+update_hosts() {
+  local ip="$1" host="$2"
+  mkdir -p "$AVAHI_DIR"
+  remove_hosts "$ip"
+  printf '%s %s # %s:%s\n' "$ip" "$host" "$MARKER" "$ip" >>"$HOSTS_FILE"
+}
+
+# Schreibt die Avahi-Service-Datei. Ohne Neustart, damit refresh nur einmal neu startet.
+announce() {
+  local ip="$1" name="${2:-}" output model uuid location formats urf color sides
+  local pdl="" fmt color_flag="F" duplex_flag="F" host file txt record
+  valid_ip "$ip" || die "Ungültige IP-Adresse: ${ip}"
+  [[ "$name" != *[[:cntrl:]]* ]] || die "Der Name darf keine Steuerzeichen enthalten."
+
+  echo "Frage Drucker ${ip} ab …"
+  output="$(query_printer "$ip")"
+
+  model="$(ipp_attr printer-make-and-model "$output")"
+  uuid="$(ipp_attr printer-uuid "$output")"
+  location="$(ipp_attr printer-location "$output")"
+  formats="$(ipp_attr document-format-supported "$output")"
+  urf="$(ipp_attr urf-supported "$output")"
+  color="$(ipp_attr color-supported "$output")"
+  sides="$(ipp_attr sides-supported "$output")"
+
+  [[ -n "$model" ]] || {
+    warn "printer-make-and-model fehlt, verwende \"Netzwerkdrucker\"."
+    model="Netzwerkdrucker"
+  }
+  [[ -n "$name" ]] || name="$model"
+  uuid="${uuid#urn:uuid:}"
+
+  if [[ -z "$urf" ]]; then
+    warn "urf-supported fehlt, verwende Fallback ${URF_FALLBACK}."
+    urf="$URF_FALLBACK"
+  fi
+
+  # Nur wenige Formate aufnehmen, damit der TXT-String unter 255 Byte bleibt.
+  for fmt in "${PDL_CANDIDATES[@]}"; do
+    if [[ "$fmt" == "image/urf" || ",${formats}," == *",${fmt},"* ]]; then
+      pdl="${pdl:+${pdl},}${fmt}"
+    fi
+  done
+
+  [[ "$color" == "true" ]] && color_flag="T"
+  [[ "$sides" == *two-sided* ]] && duplex_flag="T"
+
+  host="$(host_name_for "$ip")"
+  file="$(service_file_for "$ip")"
+
+  local -a records=(
+    "txtvers=1"
+    "qtotal=1"
+    "rp=ipp/print"
+    "ty=${model}"
+    "product=(${model})"
+    "note=${location}"
+    "adminurl=http://${ip}/"
+    "priority=0"
+    "pdl=${pdl}"
+    "URF=${urf}"
+    "kind=document"
+    "Copies=T"
+    "Color=${color_flag}"
+    "Duplex=${duplex_flag}"
+    "TLS=1.2"
+  )
+  [[ -n "$uuid" ]] && records+=("UUID=${uuid}")
+
+  txt=""
+  for record in "${records[@]}"; do
+    (($(printf '%s' "$record" | wc -c) <= 255)) || warn "TXT-Eintrag länger als 255 Byte: ${record%%=*}"
+    txt+="    <txt-record>$(xml_escape "$record")</txt-record>"$'\n'
+  done
+
+  mkdir -p "$SERVICES_DIR"
+  {
+    cat <<EOF
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!-- Erzeugt von airprint-announce – manuelle Änderungen werden bei refresh überschrieben. -->
+<!-- ${MARKER}:ip=${ip} -->
+<!-- ${MARKER}:name=$(comment_escape "$name") -->
+<service-group>
+  <name replace-wildcards="no">$(xml_escape "$name")</name>
+  <service>
+    <type>_ipp._tcp</type>
+    <subtype>_universal._sub._ipp._tcp</subtype>
+    <port>631</port>
+    <host-name>${host}</host-name>
+EOF
+    printf '%s' "$txt"
+    cat <<EOF
+  </service>
+  <service>
+    <type>_ipps._tcp</type>
+    <subtype>_universal._sub._ipps._tcp</subtype>
+    <port>443</port>
+    <host-name>${host}</host-name>
+EOF
+    printf '%s' "$txt"
+    cat <<EOF
+  </service>
+</service-group>
+EOF
+  } >"${file}.tmp"
+  mv -f "${file}.tmp" "$file"
+
+  update_hosts "$ip" "$host"
+  echo "Angekündigt: \"${name}\" (${model}) als ${host} -> ${ip}"
+}
+
+# Liest "ip<TAB>name" aus einer Service-Datei.
+read_service() {
+  local file="$1" ip name
+  ip="$(sed -n "s/^<!-- ${MARKER}:ip=\(.*\) -->\$/\1/p" "$file" | head -n 1)"
+  name="$(sed -n "s/^<!-- ${MARKER}:name=\(.*\) -->\$/\1/p" "$file" | head -n 1)"
+  [[ -n "$ip" ]] || return 1
+  printf '%s\t%s\n' "$ip" "$(xml_unescape "$name")"
+}
+
+service_files() {
+  local f
+  shopt -s nullglob
+  for f in "${SERVICES_DIR}/${SERVICE_PREFIX}"*.service; do
+    echo "$f"
+  done
+  shopt -u nullglob
+}
+
+cmd_add() {
+  [[ $# -ge 1 && $# -le 2 ]] || die "Verwendung: ${0##*/} add <IP> [\"Name\"]"
+  require_root
+  announce "$1" "${2:-}"
+  restart_avahi
+}
+
+cmd_remove() {
+  [[ $# -eq 1 ]] || die "Verwendung: ${0##*/} remove <IP>"
+  local ip="$1" file
+  valid_ip "$ip" || die "Ungültige IP-Adresse: ${ip}"
+  require_root
+  file="$(service_file_for "$ip")"
+  [[ -f "$file" ]] || die "Kein angekündigter Drucker mit IP ${ip} gefunden."
+  rm -f "$file"
+  remove_hosts "$ip"
+  echo "Entfernt: ${ip}"
+  restart_avahi
+}
+
+cmd_refresh() {
+  [[ $# -eq 0 ]] || die "Verwendung: ${0##*/} refresh"
+  require_root
+  local file entry ip name failed=0 count=0
+  while IFS= read -r file; do
+    entry="$(read_service "$file")" || {
+      warn "Kann ${file} nicht auslesen, übersprungen."
+      continue
+    }
+    ip="${entry%%$'\t'*}"
+    name="${entry#*$'\t'}"
+    count=$((count + 1))
+    # Subshell, damit ein nicht erreichbarer Drucker die übrigen nicht blockiert.
+    (announce "$ip" "$name") || {
+      warn "Aktualisierung von ${ip} fehlgeschlagen, alte Ankündigung bleibt bestehen."
+      failed=$((failed + 1))
+    }
+  done < <(service_files)
+  if ((count == 0)); then
+    echo "Keine Drucker angekündigt."
+    return 0
+  fi
+  restart_avahi
+  ((failed == 0)) || die "${failed} von ${count} Drucker(n) konnten nicht aktualisiert werden."
+  echo "${count} Drucker aktualisiert."
+}
+
+cmd_list() {
+  local file entry ip name model found=0
+  while IFS= read -r file; do
+    entry="$(read_service "$file")" || continue
+    ip="${entry%%$'\t'*}"
+    name="${entry#*$'\t'}"
+    model="$(sed -n 's/^ *<txt-record>ty=\(.*\)<\/txt-record>$/\1/p' "$file" | head -n 1)"
+    if ((found == 0)); then
+      printf '%-16s %-32s %-34s %s\n' "IP" "Name" "mDNS-Host" "Modell"
+    fi
+    found=1
+    printf '%-16s %-32s %-34s %s\n' "$ip" "$name" "$(host_name_for "$ip")" "$(xml_unescape "$model")"
+  done < <(service_files)
+  ((found)) || echo "Keine Drucker angekündigt."
+}
+
+cmd_status() {
+  echo "== avahi-daemon =="
+  systemctl --no-pager status avahi-daemon 2>&1 | head -n 5 || true
+  echo
+  echo "== Angekündigte Drucker =="
+  cmd_list
+  echo
+  echo "== Sichtbare IPP-Dienste (avahi-browse -rpt _ipp._tcp) =="
+  if command -v avahi-browse >/dev/null 2>&1; then
+    avahi-browse -rpt _ipp._tcp 2>&1 || true
+  else
+    echo "avahi-browse nicht gefunden (Paket avahi-utils installieren)."
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+  add) cmd_add "$@" ;;
+  remove) cmd_remove "$@" ;;
+  refresh) cmd_refresh "$@" ;;
+  list) cmd_list ;;
+  status) cmd_status ;;
+  -h | --help | help) usage ;;
+  "")
+    usage
+    exit 1
+    ;;
+  *)
+    usage >&2
+    die "Unbekannter Befehl: ${cmd}"
+    ;;
+  esac
+}
+
+main "$@"
